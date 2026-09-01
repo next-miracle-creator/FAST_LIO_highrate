@@ -1,3 +1,50 @@
+## Fork 说明
+
+本仓库 fork 自 [hku-mars/FAST_LIO](https://github.com/hku-mars/FAST_LIO)，在原版基础上增加了 **高频 odometry 输出**功能。
+
+### 改动内容
+
+**核心改动（`src/laserMapping.cpp`）：**
+- 新增 `kf_highrate`：独立的 ESKF，只做 IMU prediction，不做 LiDAR update
+- 独立 ROS callback queue + AsyncSpinner 线程，高频 IMU callback 不被主循环阻塞
+- 每次 LiDAR correction 后，reset `kf_highrate` 并从 correction 时间点 replay IMU history 到当前时刻
+- 输出 `/odometry_highrate`（`nav_msgs/Odometry`），频率 = IMU 频率（~200Hz）
+- 填充 body-frame velocity、bias-corrected angular velocity、pose/twist covariance
+
+**其他改动：**
+- `src/IMU_Processing.hpp`：暴露 `get_acc_scale()` 供 highrate 使用
+- `config/*.yaml`：新增 `publish/highrate_en`、`highrate_topic`、`highrate_history_s`、`highrate_max_imu_gap_s` 参数
+- `timediff_lidar_wrt_imu` 改为线程安全（atomic + mutex）
+
+### 用法
+
+```bash
+roslaunch fast_lio mapping.launch   # 或 mapping_avia.launch 等
+```
+
+原版 topic `/Odometry`（10Hz LiDAR corrected）保持不变。
+
+新增 topic `/odometry_highrate`（IMU 频率，~200Hz），可通过 YAML 参数控制：
+
+```yaml
+publish:
+  highrate_en: true                    # 开关
+  highrate_topic: "/odometry_highrate" # topic 名
+  highrate_history_s: 1.0              # IMU history 保留时长
+  highrate_max_imu_gap_s: 0.05         # IMU 间隔超过此值则暂停输出
+```
+
+### 输出语义
+
+| topic | 频率 | 坐标系 | 含义 |
+|---|---|---|---|
+| `/Odometry` | 10Hz | camera_init → body | LiDAR correction 后的状态 |
+| `/odometry_highrate` | ~200Hz | camera_init → body | IMU propagation 的实时状态 |
+
+`twist.linear` 为 body-frame 速度，`twist.angular` 为 body-frame 角速度（已去 bias）。
+
+---
+
 ## Related Works and Extended Application
 
 **SLAM:**

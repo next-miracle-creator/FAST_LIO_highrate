@@ -34,6 +34,7 @@
 // POSSIBILITY OF SUCH DAMAGE.
 #include <omp.h>
 #include <mutex>
+#include <atomic>
 #include <math.h>
 #include <thread>
 #include <fstream>
@@ -42,6 +43,7 @@
 #include <Python.h>
 #include <so3_math.h>
 #include <ros/ros.h>
+#include <ros/callback_queue.h>
 #include <Eigen/Core>
 #include "IMU_Processing.hpp"
 #include <nav_msgs/Odometry.h>
@@ -131,6 +133,41 @@ MeasureGroup Measures;
 esekfom::esekf<state_ikfom, 12, input_ikfom> kf;
 state_ikfom state_point;
 vect3 pos_lid;
+
+esekfom::esekf<state_ikfom, 12, input_ikfom> kf_highrate;
+
+using ESEKF =
+    esekfom::esekf<state_ikfom, 12, input_ikfom>;
+
+using ESEKFCov =
+    ESEKF::cov;
+
+std::mutex mtx_highrate;
+
+std::deque<sensor_msgs::Imu::ConstPtr>
+    imu_highrate_history;
+
+sensor_msgs::Imu::ConstPtr
+    imu_highrate_prev;
+
+bool highrate_ready = false;
+
+double highrate_state_time = -1.0;
+
+double highrate_acc_scale = 1.0;
+
+Eigen::Matrix<double, 12, 12>
+    highrate_Q;
+
+double highrate_history_s = 1.0;
+
+double highrate_max_imu_gap_s = 0.05;
+
+bool highrate_pub_en = false;
+
+string imu_highrate_topic;
+
+ros::Publisher pubOdomHighrate;
 
 nav_msgs::Path path;
 nav_msgs::Odometry odomAftMapped;
@@ -298,7 +335,8 @@ void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
 }
 
 double timediff_lidar_wrt_imu = 0.0;
-bool   timediff_set_flg = false;
+std::mutex mtx_timediff;
+std::atomic<bool> timediff_set_flg{false};
 void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg) 
 {
     mtx_buffer.lock();
@@ -318,8 +356,8 @@ void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg)
 
     if (time_sync_en && !timediff_set_flg && abs(last_timestamp_lidar - last_timestamp_imu) > 1 && !imu_buffer.empty())
     {
-        timediff_set_flg = true;
         timediff_lidar_wrt_imu = last_timestamp_lidar + 0.1 - last_timestamp_imu;
+        timediff_set_flg.store(true, std::memory_order_release);
         printf("Self sync IMU and LiDAR, time diff is %.10lf \n", timediff_lidar_wrt_imu);
     }
 
@@ -361,6 +399,189 @@ void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
     imu_buffer.push_back(msg);
     mtx_buffer.unlock();
     sig_buffer.notify_all();
+}
+void highrate_predict(const sensor_msgs::Imu::ConstPtr &head, const sensor_msgs::Imu::ConstPtr &tail, double dt)
+{
+    V3D angvel_avr;
+    V3D acc_avr;
+
+    angvel_avr <<
+        0.5 * (
+            head->angular_velocity.x +
+            tail->angular_velocity.x),
+        0.5 * (
+            head->angular_velocity.y +
+            tail->angular_velocity.y),
+        0.5 * (
+            head->angular_velocity.z +
+            tail->angular_velocity.z);
+
+    acc_avr <<
+        0.5 * (
+            head->linear_acceleration.x +
+            tail->linear_acceleration.x),
+        0.5 * (
+            head->linear_acceleration.y +
+            tail->linear_acceleration.y),
+        0.5 * (
+            head->linear_acceleration.z +
+            tail->linear_acceleration.z);
+
+    acc_avr *= highrate_acc_scale;
+
+    input_ikfom in;
+    in.acc  = acc_avr;
+    in.gyro = angvel_avr;
+
+    kf_highrate.predict(
+        dt,
+        highrate_Q,
+        in
+    );
+}
+
+nav_msgs::Odometry make_highrate_odometry(
+    const sensor_msgs::Imu::ConstPtr &imu_msg)
+{
+    state_ikfom state = kf_highrate.get_x();
+    auto P = kf_highrate.get_P();
+
+    nav_msgs::Odometry msg;
+    msg.header.stamp = imu_msg->header.stamp;
+    msg.header.frame_id = "camera_init";
+    msg.child_frame_id = "body";
+
+    msg.pose.pose.position.x = state.pos.x();
+    msg.pose.pose.position.y = state.pos.y();
+    msg.pose.pose.position.z = state.pos.z();
+    msg.pose.pose.orientation.x = state.rot.coeffs()[0];
+    msg.pose.pose.orientation.y = state.rot.coeffs()[1];
+    msg.pose.pose.orientation.z = state.rot.coeffs()[2];
+    msg.pose.pose.orientation.w = state.rot.coeffs()[3];
+
+    for (int r = 0; r < 6; ++r)
+    {
+        for (int c = 0; c < 6; ++c)
+        {
+            msg.pose.covariance[r * 6 + c] = P(r, c);
+        }
+    }
+
+    V3D vel_body = state.rot.conjugate() * state.vel;
+    msg.twist.twist.linear.x = vel_body.x();
+    msg.twist.twist.linear.y = vel_body.y();
+    msg.twist.twist.linear.z = vel_body.z();
+
+    V3D omega_body(
+        imu_msg->angular_velocity.x - state.bg.x(),
+        imu_msg->angular_velocity.y - state.bg.y(),
+        imu_msg->angular_velocity.z - state.bg.z());
+    msg.twist.twist.angular.x = omega_body.x();
+    msg.twist.twist.angular.y = omega_body.y();
+    msg.twist.twist.angular.z = omega_body.z();
+
+    M3D R = state.rot.toRotationMatrix();
+    M3D P_v_world = P.block<3, 3>(12, 12);
+    M3D P_v_body = R.transpose() * P_v_world * R;
+    for (int r = 0; r < 3; ++r)
+    {
+        for (int c = 0; c < 3; ++c)
+        {
+            msg.twist.covariance[r * 6 + c] = P_v_body(r, c);
+        }
+    }
+
+    return msg;
+}
+
+void imu_highrate_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
+{
+    sensor_msgs::Imu::Ptr msg(
+        new sensor_msgs::Imu(*msg_in)
+    );
+
+    //
+    // 必须与原 imu_cbk 使用完全相同
+    // 的 timestamp correction
+    //
+    double timestamp =msg_in->header.stamp.toSec() - time_diff_lidar_to_imu;
+
+    if (time_sync_en && timediff_set_flg.load(std::memory_order_acquire))
+    {
+        std::lock_guard<std::mutex> lock(mtx_timediff);
+        timestamp = timediff_lidar_wrt_imu + msg_in->header.stamp.toSec();
+    }
+
+    msg->header.stamp = ros::Time().fromSec(timestamp);
+
+    nav_msgs::Odometry odom;
+    bool should_publish = false;
+
+    {
+        std::lock_guard<std::mutex>
+            lock(mtx_highrate);
+
+        //
+        // timestamp rollback
+        //
+        if (!imu_highrate_history.empty() &&
+            timestamp <=
+            imu_highrate_history.back()
+                ->header.stamp.toSec())
+        {
+            imu_highrate_history.clear();
+            imu_highrate_prev.reset();
+            highrate_ready = false;
+            return;
+        }
+
+        imu_highrate_history.push_back(msg);
+
+        //
+        // trim history
+        //
+        while (!imu_highrate_history.empty() &&
+               timestamp -
+               imu_highrate_history.front()
+                   ->header.stamp.toSec()
+               > highrate_history_s)
+        {
+            imu_highrate_history.pop_front();
+        }
+
+        if (!highrate_ready)
+            return;
+
+        if (timestamp <= highrate_state_time)
+            return;
+
+        if (!imu_highrate_prev)
+            return;
+
+        double dt =
+            timestamp - highrate_state_time;
+
+        if (dt <= 0.0)
+            return;
+
+        if (dt > highrate_max_imu_gap_s)
+        {
+            highrate_ready = false;
+            return;
+        }
+
+        highrate_predict(imu_highrate_prev, msg, dt);
+
+        highrate_state_time = timestamp;
+        imu_highrate_prev = msg;
+
+        odom = make_highrate_odometry(msg);
+
+        should_publish = true;
+    }
+
+    if (should_publish)
+        pubOdomHighrate.publish(odom);
 }
 
 double lidar_mean_scantime = 0.0;
@@ -753,19 +974,113 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     solve_time += omp_get_wtime() - solve_start_;
 }
 
+void correct_highrate_from_lio(
+    const state_ikfom &corrected_state,
+    const ESEKFCov &corrected_P,
+    double corrected_time,
+    double acc_scale,
+    const Eigen::Matrix<double, 12, 12> &Q)
+{
+    std::lock_guard<std::mutex>
+        lock(mtx_highrate);
+
+    //
+    // 1. reset
+    //
+    kf_highrate.change_x(
+        corrected_state);
+
+    kf_highrate.change_P(
+        corrected_P);
+
+    highrate_state_time =
+        corrected_time;
+
+    highrate_acc_scale =
+        acc_scale;
+
+    highrate_Q = Q;
+
+    highrate_ready = true;
+    imu_highrate_prev.reset();
+
+    //
+    // 2. find IMU just before correction
+    //
+    sensor_msgs::Imu::ConstPtr prev;
+
+    for (const auto &imu :
+         imu_highrate_history)
+    {
+        double t =
+            imu->header.stamp.toSec();
+
+        if (t <= corrected_time)
+        {
+            prev = imu;
+            continue;
+        }
+
+        if (!prev)
+        {
+            //
+            // history 不够
+            //
+            highrate_ready = false;
+            return;
+        }
+
+        double dt =
+            t - highrate_state_time;
+
+        if (dt <= 0.0)
+        {
+            prev = imu;
+            continue;
+        }
+
+        if (dt >
+            highrate_max_imu_gap_s)
+        {
+            highrate_ready = false;
+            return;
+        }
+
+        //
+        // 3. replay
+        //
+        highrate_predict(
+            prev,
+            imu,
+            dt);
+
+        highrate_state_time = t;
+        prev = imu;
+    }
+
+    imu_highrate_prev = prev;
+}
+
 int main(int argc, char** argv)
 {
     ros::init(argc, argv, "laserMapping");
     ros::NodeHandle nh;
+    ros::CallbackQueue highrate_queue;
+    ros::NodeHandle nh_highrate;
+    nh_highrate.setCallbackQueue(&highrate_queue);
 
     nh.param<bool>("publish/path_en",path_en, true);
     nh.param<bool>("publish/scan_publish_en",scan_pub_en, true);
     nh.param<bool>("publish/dense_publish_en",dense_pub_en, true);
     nh.param<bool>("publish/scan_bodyframe_pub_en",scan_body_pub_en, true);
+    nh.param<bool>("publish/highrate_en",highrate_pub_en, true);
+    nh.param<double>("publish/highrate_history_s",highrate_history_s, 1.0);
+    nh.param<double>("publish/highrate_max_imu_gap_s", highrate_max_imu_gap_s, 0.05);
     nh.param<int>("max_iteration",NUM_MAX_ITERATIONS,4);
     nh.param<string>("map_file_path",map_file_path,"");
     nh.param<string>("common/lid_topic",lid_topic,"/livox/lidar");
     nh.param<string>("common/imu_topic", imu_topic,"/livox/imu");
+    nh.param<string>("publish/highrate_topic", imu_highrate_topic,"/odometry_highrate");
     nh.param<bool>("common/time_sync_en", time_sync_en, false);
     nh.param<double>("common/time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
     nh.param<double>("filter_size_corner",filter_size_corner_min,0.5);
@@ -826,6 +1141,7 @@ int main(int argc, char** argv)
     double epsi[23] = {0.001};
     fill(epsi, epsi+23, 0.001);
     kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
+    kf_highrate.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
 
     /*** debug record ***/
     FILE *fp;
@@ -846,6 +1162,7 @@ int main(int argc, char** argv)
         nh.subscribe(lid_topic, 200000, livox_pcl_cbk) : \
         nh.subscribe(lid_topic, 200000, standard_pcl_cbk);
     ros::Subscriber sub_imu = nh.subscribe(imu_topic, 200000, imu_cbk);
+    ros::Subscriber sub_imu_highrate = nh_highrate.subscribe(imu_topic, 2000, imu_highrate_cbk);
     ros::Publisher pubLaserCloudFull = nh.advertise<sensor_msgs::PointCloud2>
             ("/cloud_registered", 100000);
     ros::Publisher pubLaserCloudFull_body = nh.advertise<sensor_msgs::PointCloud2>
@@ -858,7 +1175,11 @@ int main(int argc, char** argv)
             ("/Odometry", 100000);
     ros::Publisher pubPath          = nh.advertise<nav_msgs::Path> 
             ("/path", 100000);
+    pubOdomHighrate = nh_highrate.advertise<nav_msgs::Odometry>
+            (imu_highrate_topic, 100000);
 //------------------------------------------------------------------------------------------------------
+    ros::AsyncSpinner highrate_spinner(1, &highrate_queue);
+    highrate_spinner.start();
     signal(SIGINT, SigHandle);
     ros::Rate rate(5000);
     bool status = ros::ok();
@@ -959,6 +1280,11 @@ int main(int argc, char** argv)
             double solve_H_time = 0;
             kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
             state_point = kf.get_x();
+
+            if (highrate_pub_en)
+            {
+                correct_highrate_from_lio(state_point, kf.get_P(), lidar_end_time, p_imu->get_acc_scale(), p_imu->Q);
+            }
             euler_cur = SO3ToEuler(state_point.rot);
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
             geoQuat.x = state_point.rot.coeffs()[0];
