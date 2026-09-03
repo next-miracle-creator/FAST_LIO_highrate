@@ -24,12 +24,16 @@ mapping:
                    0, 0, 1]
 
 publish:
-    path_en:  false
+    path_en:  true
     scan_publish_en:  true       # false: close all the point cloud output
     dense_publish_en: true       # false: low down the points number in a global-frame point clouds scan.
     scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
     highrate_en: true
     highrate_topic: "/odometry_highrate"
+    highrate_path_en: true
+    highrate_path_topic: "/path_highrate"
+    highrate_path_rate: 20.0
+    highrate_path_max_points: 2000
     highrate_history_s: 1.0
     highrate_max_imu_gap_s: 0.05
 
