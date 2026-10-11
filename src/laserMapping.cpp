@@ -58,7 +58,7 @@
 #include <tf/transform_datatypes.h>
 #include <tf/transform_broadcaster.h>
 #include <geometry_msgs/Vector3.h>
-#include <livox_ros_driver/CustomMsg.h>
+#include <livox_ros_driver2/CustomMsg.h>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
 
@@ -168,6 +168,20 @@ bool highrate_pub_en = false;
 string imu_highrate_topic;
 
 ros::Publisher pubOdomHighrate;
+
+bool highrate_path_en = false;
+
+string highrate_path_topic;
+
+double highrate_path_rate = 20.0;
+
+int highrate_path_max_points = 2000;
+
+double highrate_path_last_stamp = -1.0;
+
+nav_msgs::Path path_highrate;
+
+ros::Publisher pubPathHighrate;
 
 nav_msgs::Path path;
 nav_msgs::Odometry odomAftMapped;
@@ -337,7 +351,7 @@ void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
 double timediff_lidar_wrt_imu = 0.0;
 std::mutex mtx_timediff;
 std::atomic<bool> timediff_set_flg{false};
-void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg) 
+void livox_pcl_cbk(const livox_ros_driver2::CustomMsg::ConstPtr &msg)
 {
     mtx_buffer.lock();
     double preprocess_start_time = omp_get_wtime();
@@ -516,6 +530,8 @@ void imu_highrate_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
 
     nav_msgs::Odometry odom;
     bool should_publish = false;
+    nav_msgs::Path highrate_path_msg;
+    bool should_publish_path = false;
 
     {
         std::lock_guard<std::mutex>
@@ -532,6 +548,8 @@ void imu_highrate_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
             imu_highrate_history.clear();
             imu_highrate_prev.reset();
             highrate_ready = false;
+            path_highrate.poses.clear();
+            highrate_path_last_stamp = -1.0;
             return;
         }
 
@@ -578,10 +596,42 @@ void imu_highrate_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
         odom = make_highrate_odometry(msg);
 
         should_publish = true;
+
+        const double path_period = 1.0 / highrate_path_rate;
+        if (highrate_path_en &&
+            (highrate_path_last_stamp < 0.0 ||
+             timestamp - highrate_path_last_stamp >= path_period))
+        {
+            geometry_msgs::PoseStamped pose;
+            pose.header = odom.header;
+            pose.pose = odom.pose.pose;
+
+            path_highrate.header = odom.header;
+            path_highrate.poses.push_back(pose);
+            highrate_path_last_stamp = timestamp;
+
+            if (highrate_path_max_points > 0 &&
+                static_cast<int>(path_highrate.poses.size()) >
+                    highrate_path_max_points)
+            {
+                const int excess =
+                    static_cast<int>(path_highrate.poses.size()) -
+                    highrate_path_max_points;
+                path_highrate.poses.erase(
+                    path_highrate.poses.begin(),
+                    path_highrate.poses.begin() + excess);
+            }
+
+            highrate_path_msg = path_highrate;
+            should_publish_path = true;
+        }
     }
 
     if (should_publish)
         pubOdomHighrate.publish(odom);
+
+    if (should_publish_path)
+        pubPathHighrate.publish(highrate_path_msg);
 }
 
 double lidar_mean_scantime = 0.0;
@@ -845,6 +895,7 @@ void publish_path(const ros::Publisher pubPath)
     set_posestamp(msg_body_pose);
     msg_body_pose.header.stamp = ros::Time().fromSec(lidar_end_time);
     msg_body_pose.header.frame_id = "camera_init";
+    path.header = msg_body_pose.header;
 
     /*** if path is too large, the rvis will crash ***/
     static int jjj = 0;
@@ -987,11 +1038,13 @@ void correct_highrate_from_lio(
     //
     // 1. reset
     //
-    kf_highrate.change_x(
-        corrected_state);
-
-    kf_highrate.change_P(
-        corrected_P);
+    // IKFoM's change_x/change_P take mutable references.  The LiDAR EKF
+    // state belongs to the mapping loop, so transfer copies to the separate
+    // high-rate predictor instead of mutating the mapping state.
+    state_ikfom highrate_state = corrected_state;
+    ESEKFCov highrate_P = corrected_P;
+    kf_highrate.change_x(highrate_state);
+    kf_highrate.change_P(highrate_P);
 
     highrate_state_time =
         corrected_time;
@@ -1074,6 +1127,13 @@ int main(int argc, char** argv)
     nh.param<bool>("publish/dense_publish_en",dense_pub_en, true);
     nh.param<bool>("publish/scan_bodyframe_pub_en",scan_body_pub_en, true);
     nh.param<bool>("publish/highrate_en",highrate_pub_en, true);
+    nh.param<bool>("publish/highrate_path_en", highrate_path_en, true);
+    nh.param<string>("publish/highrate_path_topic", highrate_path_topic,
+                     "/path_highrate");
+    nh.param<double>("publish/highrate_path_rate", highrate_path_rate,
+                     20.0);
+    nh.param<int>("publish/highrate_path_max_points",
+                  highrate_path_max_points, 2000);
     nh.param<double>("publish/highrate_history_s",highrate_history_s, 1.0);
     nh.param<double>("publish/highrate_max_imu_gap_s", highrate_max_imu_gap_s, 0.05);
     nh.param<int>("max_iteration",NUM_MAX_ITERATIONS,4);
@@ -1112,6 +1172,13 @@ int main(int argc, char** argv)
     
     path.header.stamp    = ros::Time::now();
     path.header.frame_id ="camera_init";
+    path_highrate.header = path.header;
+
+    if (highrate_path_rate <= 0.0)
+    {
+        ROS_WARN("publish/highrate_path_rate must be positive; using 20 Hz");
+        highrate_path_rate = 20.0;
+    }
 
     /*** variables definition ***/
     int effect_feat_num = 0, frame_num = 0;
@@ -1177,6 +1244,8 @@ int main(int argc, char** argv)
             ("/path", 100000);
     pubOdomHighrate = nh_highrate.advertise<nav_msgs::Odometry>
             (imu_highrate_topic, 100000);
+    pubPathHighrate = nh_highrate.advertise<nav_msgs::Path>
+            (highrate_path_topic, 10);
 //------------------------------------------------------------------------------------------------------
     ros::AsyncSpinner highrate_spinner(1, &highrate_queue);
     highrate_spinner.start();
